@@ -58,27 +58,34 @@ async function cloudFindRow(fid){
   return null;
 }
 async function cloudGetAttachment(row, col){
-  // 镜像表附件列存的是富文本字符串 "[{\"fileToken\":\"...\"}]"，从中解析 token
-  const range = `${SHEET_ID}!${col}${row}:${col}${parseInt(row)+1}`;
+  // 镜像表附件列存的是 JSON 字符串 "[{\"fileToken\":\"...\"}]"，从中解析 token
+  const range = `${SHEET_ID}!${col}${row}:${col}${row}`;
   const j = await feishu('GET', `/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/values/${range}`);
   const vals = j.data && j.data.valueRange && j.data.valueRange.values;
   const raw = vals && vals[0] && vals[0][0];
   if(!raw) return null;
-  const str = typeof raw==='string'?raw:JSON.stringify(raw);
-  const m = str.match(/fileToken["']?\s*[:"]\s*([A-Za-z0-9]+)/i);
+  let arr = raw;
+  if(typeof raw === 'string'){ try{ arr = JSON.parse(raw); }catch(_){ arr = null; } }
+  if(Array.isArray(arr)){ for(const x of arr){ if(x && x.fileToken) return {token:x.fileToken, name:''}; } }
+  if(arr && typeof arr==='object' && arr.fileToken) return {token:arr.fileToken, name:''};
+  const m = String(raw).match(/fileToken["']?\s*[:"]\s*([A-Za-z0-9]+)/i);
   return m?{token:m[1], name:''}:null;
 }
 async function cloudDownload(token, outPath){
+  // 注意：用 drive /files/ 端点（bot 身份对 /medias/ 端点会 403）
   const t = await cloudToken();
-  const r = await fetch(DOMAIN+`/open-apis/drive/v1/medias/${token}/download`, {headers:{Authorization:`Bearer ${t}`}});
+  const url = DOMAIN+`/open-apis/drive/v1/files/${token}/download`;
+  console.log('[dl] GET', url, 'tok=', t.slice(0,8), 'proxy=', process.env.HTTPS_PROXY||process.env.https_proxy||'none');
+  const r = await fetch(url, {headers:{Authorization:`Bearer ${t}`}});
+  console.log('[dl] status=', r.status, 'redirected=', r.redirected, 'type=', r.headers.get('content-type'));
   if(!r.ok) throw new Error('download HTTP '+r.status);
   const buf = Buffer.from(await r.arrayBuffer());
   fs.writeFileSync(outPath, buf);
   return buf.length;
 }
 async function cloudCsvColumn(col, maxRow){
-  // 批量读 B 列用于搜索缓存
-  const range = `${col}1:${col}${maxRow}`;
+  // 批量读某列用于搜索缓存（range 必须带 SHEET_ID 前缀）
+  const range = `${SHEET_ID}!${col}1:${col}${maxRow}`;
   const j = await feishu('GET', `/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/values/${range}`);
   const rows = (j.data && j.data.valueRange && j.data.valueRange.values) || [];
   return rows.map(r=>r[0]?String(r[0]):'');
@@ -144,34 +151,134 @@ async function download(token,outRel){ return CLOUD ? await cloudDownload(token,
 const TMP_DIR = path.join(__dirname,'tmp');
 if(!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR,{recursive:true});
 
+/* --- 格式自适应读取: PK头=xlsx, 否则CSV(UTF-8/GBK自动) --- */
+function decodeBuf(buf){
+  let txt=buf.toString('utf8');
+  if(txt.includes('\uFFFD')){ try{ txt=new TextDecoder('gbk').decode(buf); console.log('[read] GBK编码'); }catch(_){} }
+  return txt.replace(/^\uFEFF/,'');
+}
+function csvParse(txt){
+  const rows=[]; let row=[], cur='', inQ=false;
+  for(let i=0;i<txt.length;i++){ const ch=txt[i];
+    if(inQ){ if(ch==='"'){ if(txt[i+1]==='"'){cur+='"';i++;} else inQ=false; } else cur+=ch; }
+    else{ if(ch==='"') inQ=true;
+      else if(ch===',') { row.push(cur); cur=''; }
+      else if(ch==='\n'){ row.push(cur); rows.push(row); row=[]; cur=''; }
+      else if(ch!=='\r') cur+=ch; } }
+  if(cur!==''||row.length){ row.push(cur); rows.push(row); }
+  return rows;
+}
+async function readRows(fp){
+  const buf=fs.readFileSync(fp);
+  if(buf.length>1&&buf[0]===0x50&&buf[1]===0x4B){ // xlsx
+    const wb=new ExcelJS.Workbook(); await wb.xlsx.load(buf);
+    const ws=wb.worksheets[0]; if(!ws) return [];
+    const rows=[];
+    for(let r=1;r<=ws.rowCount;r++){ const row=ws.getRow(r); const vals=[];
+      for(let c=1;c<=Math.max(row.cellCount,30);c++){ let v=row.getCell(c).value;
+        if(v&&typeof v==='object') v = v.richText? v.richText.map(t=>t.text).join('') : (v.text!==undefined? v.text : (v.result!==undefined? v.result : ''));
+        vals.push(v===null||v===undefined?'':v); }
+      rows.push(vals); }
+    return rows;
+  }
+  console.log('[read] 非zip, 按CSV解析');
+  return csvParse(decodeBuf(buf));
+}
+/* --- 亚马逊官方"箱内容清单"CSV (工作流导出, 分区+箱号列表) --- */
+function isAmzWorkflow(rows){
+  return rows.some(r=>{const a=String((r&&r[0])||''); return a.includes('货件编号')||a.includes('工作流程名称');})
+      && rows.some(r=>{const j=(r||[]).join(','); return String((r&&r[0])||'').trim()==='SKU'&&j.includes('FNSKU');});
+}
+function parseAmzWorkflow(rows){
+  const items=[]; let mode=null, ci=null, boxCols=null;
+  const boxDims={}; // boxNo -> {weight,len,wid,hgt} (矩阵分区底部箱规)
+  const dimKey=s=> s.includes('重量')?'weight': s.includes('长度')?'len': s.includes('宽度')?'wid': s.includes('高度')?'hgt': null;
+  const mkItem=o=>({boxNo:'',sku:'',fnsku:'',nameCn:'',nameEn:'',qty:0,declare:'',cost:'',material:'',hs:'',brand:'',weight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',asin:'',...o});
+  for(const raw of rows){
+    const vals=(raw||[]).map(v=>String(v==null?'':v).trim());
+    const joined=vals.join(',');
+    /* 矩阵分区底部箱规行: ",,,,,,,,包装箱重量（千克）：,13,8.75,..." */
+    const dimCell=vals.findIndex(v=>v.startsWith('包装箱')&&dimKey(v));
+    if(dimCell>=0 && boxCols){
+      const k=dimKey(vals[dimCell]);
+      for(const bc of boxCols){ const v=vals[bc.idx]; if(v) (boxDims[bc.boxNo]=boxDims[bc.boxNo]||{})[k]=v; }
+      continue;
+    }
+    /* 表头行 */
+    if(vals[0]==='SKU' && joined.includes('FNSKU')){
+      const f=names=>vals.findIndex(h=>names.some(n=>h===n||h.includes(n)));
+      if(joined.includes('每箱件数')&&joined.includes('箱号')){ /* 列表分区(原厂包装) */
+        mode='list';
+        ci={sku:0, name:f(['商品名称']), asin:f(['ASIN']), fnsku:f(['FNSKU']),
+            weight:f(['包装箱重量','箱重']), len:f(['箱子长度']), wid:f(['箱子宽度']), hgt:f(['箱子高度']),
+            qty:f(['每箱件数']), ctns:f(['箱子总数']), box:f(['箱号'])};
+      } else { /* 矩阵分区(单件/混装): 箱号FBA...U000035做列头 */
+        boxCols=[];
+        vals.forEach((h,i)=>{ const m=h.match(/U0*(\d+)$/); if(m) boxCols.push({idx:i, boxNo:'B'+parseInt(m[1])}); });
+        if(boxCols.length){ mode='matrix'; ci={sku:0, name:f(['商品名称']), asin:f(['ASIN']), fnsku:f(['FNSKU'])}; }
+      }
+      continue;
+    }
+    if(!mode) continue;
+    const sku=vals[0]; if(!sku||sku==='SKU') continue;
+    const nameEn=(vals[ci.name]||'').replace(/''/g,"'");
+    if(mode==='list'){
+      const qty=parseInt(vals[ci.qty])||0; if(!qty) continue;
+      let labels=String(vals[ci.box]||'').split(/[,，\s]+/).filter(Boolean);
+      if(labels.length===0){ const n=parseInt(vals[ci.ctns])||1; for(let b=1;b<=n;b++) labels.push('B'+b); }
+      for(const lb of labels){
+        const m=lb.match(/U0*(\d+)$/); const boxNo=m?('B'+parseInt(m[1])):lb;
+        items.push(mkItem({boxNo, sku, fnsku:vals[ci.fnsku]||'', nameEn, qty,
+          weight:vals[ci.weight]||'', len:vals[ci.len]||'', wid:vals[ci.wid]||'', hgt:vals[ci.hgt]||'', asin:vals[ci.asin]||''}));
+      }
+    } else { /* matrix: 每个箱列一个数量 */
+      for(const bc of boxCols){
+        const q=parseInt(vals[bc.idx])||0; if(!q) continue;
+        items.push(mkItem({boxNo:bc.boxNo, sku, fnsku:vals[ci.fnsku]||'', nameEn, qty:q, asin:vals[ci.asin]||''}));
+      }
+    }
+  }
+  for(const it of items){ const d=boxDims[it.boxNo]; if(d){ it.weight=it.weight||d.weight||''; it.len=it.len||d.len||''; it.wid=it.wid||d.wid||''; it.hgt=it.hgt||d.hgt||''; } }
+  return items;
+}
+
 async function parseXlsx(xlsxPath, fnskuPath){
-  const wb=new ExcelJS.Workbook(); await wb.xlsx.readFile(xlsxPath);
-  const ws=wb.worksheets[0]; if(!ws) return {items:[], error:'空表'};
+  const rows=await readRows(xlsxPath);
+  if(!rows.length) return {items:[], error:'空表'};
   let fnskuMap={};
   if(fnskuPath && fs.existsSync(fnskuPath)){
-    try{ const wb2=new ExcelJS.Workbook(); await wb2.xlsx.readFile(fnskuPath); const ws2=wb2.worksheets[0];
-      if(ws2) for(let r=2;r<=ws2.rowCount;r++){ const rr=ws2.getRow(r); const ms=String(rr.getCell(1).value||'').trim(), fn=String(rr.getCell(2).value||'').trim(), nm=String(rr.getCell(3).value||'').trim(); if(ms&&nm){fnskuMap[ms.toUpperCase()]=nm;fnskuMap[fn.toUpperCase()]=nm;} }
+    try{ const rows2=await readRows(fnskuPath);
+      for(let r=1;r<rows2.length;r++){ const rr=rows2[r]||[]; const ms=String(rr[0]||'').trim(), fn=String(rr[1]||'').trim(), nm=String(rr[2]||'').trim(); if(ms&&nm){fnskuMap[ms.toUpperCase()]=nm;fnskuMap[fn.toUpperCase()]=nm;} }
     }catch(e){ console.log('[fnsku] fail', e.message.substring(0,60)); }
   }
+  /* 亚马逊工作流CSV: 专用解析 */
+  if(isAmzWorkflow(rows)){
+    const items=parseAmzWorkflow(rows);
+    for(const it of items){ if(!it.nameEn){const k=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k]) it.nameEn=fnskuMap[k];} }
+    console.log(`[parse] 亚马逊箱内容清单CSV items=${items.length}`);
+    return {items, error: items.length?null:'亚马逊CSV解析0行'};
+  }
+  /* 通用表格 (xlsx或普通CSV) */
+  const getCell=(r,c)=>{ const v=(rows[r-1]||[])[c-1]; return v===null||v===undefined?'':v; };
+  const rowCount=rows.length;
   let headerRow=1, isAmazon=false;
-  for(let r=1;r<=Math.min(ws.rowCount,5);r++){
-    const row=ws.getRow(r); let txt='';
-    for(let c=1;c<=row.cellCount;c++) txt+=String(row.getCell(c).value||'');
+  for(let r=1;r<=Math.min(rowCount,5);r++){
+    let txt=(rows[r-1]||[]).map(v=>String(v==null?'':v)).join('');
     const low=txt.toLowerCase();
     if(low.includes('序号')&&low.includes('msku')&&low.includes('单箱数量')){headerRow=r; isAmazon=true; break;}
     if(low.includes('箱号')&&low.includes('sku')){headerRow=r; break;}
     if(low.includes('序号')&&low.includes('sku')){headerRow=r; break;}
   }
-  const hdr=ws.getRow(headerRow); const headers=[];
-  for(let c=1;c<=Math.max(hdr.cellCount,30);c++) headers.push(String(hdr.getCell(c).value||'').trim());
+  const headers=[];
+  for(let c=1;c<=Math.max((rows[headerRow-1]||[]).length,30);c++) headers.push(String(getCell(headerRow,c)).trim());
   const low=headers.map(h=>h.toLowerCase());
   const find=cands=>{const i=low.findIndex(h=>cands.some(k=>h===k||h.includes(k))); return i>=0?i+1:0;};
   const col={seq:find(['序号','no','number','num','row']), sku:find(['msku','sku','型号','产品型号']), fnsku:find(['fnsku']), nameCn:find(['中文品名','品名','名称','中文名称']), nameEn:find(['英文品名','英文名称','product name','nameen']), qty:find(['单箱数量','数量','qty','quantity']), ctns:find(['箱数','ctns','cartons']), boxName:find(['箱子名称','box label','箱号名称','label']), boxNo:find(['箱号','box no','carton','boxno','ctn']), weight:find(['箱子毛重','单箱毛重','箱重','重量','weight']), declare:find(['申报价','申报价值','declare','申报单价','unit price']), cost:find(['成本','采购价','cost']), material:find(['材质','material']), hs:find(['hs','海关编码','hscode']), brand:find(['品牌','brand']), len:find(['箱子长度','长','length']), wid:find(['箱子宽度','宽','width']), hgt:find(['箱子高度','高','height']), elec:find(['带电','elec']), magnet:find(['带磁','magnet']), saleUrl:find(['销售链接','sale url','saleurl'])};
   console.log(`[parse] headerRow=${headerRow} isAmazon=${isAmazon} sku=${col.sku} fnsku=${col.fnsku} qty=${col.qty} boxName=${col.boxName}`);
   const items=[];
-  for(let r=headerRow+1;r<=ws.rowCount;r++){
-    const row=ws.getRow(r); const vals=[];
-    for(let c=1;c<=Math.max(row.cellCount,30);c++) vals.push(row.getCell(c).value);
+  for(let r=headerRow+1;r<=rowCount;r++){
+    const vals=[];
+    for(let c=1;c<=Math.max((rows[r-1]||[]).length,30);c++){ const v=getCell(r,c); vals.push(v===''?null:v); }
     if(vals.every(v=>v===null||v===undefined||v==='')) continue;
     const get=idx=>idx>0&&vals[idx-1]!==null&&vals[idx-1]!==undefined?String(vals[idx-1]).trim():'';
     if(isAmazon){
@@ -217,7 +324,7 @@ app.post('/api/fetch-packing-list', async (req,res)=>{
     const n=await download(pack.token, pRel);
     if(!n) return res.json({ok:false, error:'下载失败', code:'DL_FAIL'});
     let fRel=null;
-    if(fnsku){ fRel=`${fid}_f.xlsx`; await download(fnsku.token, fRel); }
+    if(fnsku){ try{ fRel=`${fid}_f.xlsx`; const fn=await download(fnsku.token, fRel); if(!fn){ fRel=null; console.log('[fnsku] 下载失败, 跳过(仅影响品名映射)'); } }catch(e){ fRel=null; console.log('[fnsku] 下载异常, 跳过:', e.message.slice(0,60)); } }
     const xp=path.join(TMP_DIR,pRel); const fp=fRel?path.join(TMP_DIR,fRel):null;
     const {items,error:pe}=await parseXlsx(xp,fp);
     try{fs.unlinkSync(xp)}catch(_){} if(fp) try{fs.unlinkSync(fp)}catch(_){}
@@ -225,7 +332,10 @@ app.post('/api/fetch-packing-list', async (req,res)=>{
   }catch(e){ console.error('[err]',e.message); res.status(500).json({ok:false, error:e.message, code:e.code}); }
 });
 
-app.listen(PORT, ()=>{
-  console.log(`\n  🚀 发票后端启动 mode=${CLOUD?'cloud(HTTP直连)':'local(lark-cli)'} port=${PORT}`);
-  setTimeout(()=>{ try{ buildCache(); }catch(_){} }, 200);
-});
+if(require.main===module){
+  app.listen(PORT, ()=>{
+    console.log(`\n  🚀 发票后端启动 mode=${CLOUD?'cloud(HTTP直连)':'local(lark-cli)'} port=${PORT}`);
+    setTimeout(()=>{ try{ buildCache(); }catch(_){} }, 200);
+  });
+}
+module.exports={parseXlsx, readRows};
