@@ -1,0 +1,13 @@
+{
+  "name": "invoice-backend",
+  "version": "1.0.0",
+  "description": "发票系统飞书装箱清单拉取后端（云端 HTTP 直连 / 本机 lark-cli 自适应）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "exceljs": "^4.4.0"
+  }
+}
