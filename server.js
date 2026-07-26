@@ -78,7 +78,7 @@ async function cloudDownload(token, outPath){
   console.log('[dl] GET', url, 'tok=', t.slice(0,8), 'proxy=', process.env.HTTPS_PROXY||process.env.https_proxy||'none');
   const r = await fetch(url, {headers:{Authorization:`Bearer ${t}`}});
   console.log('[dl] status=', r.status, 'redirected=', r.redirected, 'type=', r.headers.get('content-type'));
-  if(!r.ok) throw new Error('download HTTP '+r.status);
+  if(!r.ok) throw new Error(r.status===403 ? '附件尚未同步到镜像库(旧token), 请稍后重试或等待同步完成' : 'download HTTP '+r.status);
   const buf = Buffer.from(await r.arrayBuffer());
   fs.writeFileSync(outPath, buf);
   return buf.length;
@@ -94,7 +94,7 @@ async function cloudCsvColumn(col, maxRow){
 /* ===================== 本机：lark-cli ===================== */
 const BASH = 'C:/Program Files/Git/bin/bash.exe';
 const SHELL = { shell: BASH, encoding: 'utf-8' };
-const IDENT = process.env.LARK_AS || 'bot';
+const IDENT = process.env.LARK_AS || 'user'; // 本机模式跨租户读源表必须user身份(bot无sheets scope且跨租户)
 function larkRaw(cmd){
   return JSON.parse(execSync(`${cmd} --as ${IDENT} --json`, {...SHELL, maxBuffer:50*1024*1024, timeout:30000}));
 }
