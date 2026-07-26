@@ -15,7 +15,7 @@ const app = express();
 const PORT = process.env.PORT || (process.env.RAILWAY ? 3000 : 3460);
 const CLOUD = !!(process.env.APP_ID && process.env.APP_SECRET); // 云端走 HTTP 直连
 const SPREADSHEET_TOKEN = process.env.SPREADSHEET_TOKEN || 'RWUDsL3PGh0J07tnAPocCm8xnrb';
-const SHEET_ID = process.env.SHEET_ID || '08e89c';
+const SHEET_ID = (process.env.SHEET_ID && process.env.SHEET_ID!=='SHEET_ID') ? process.env.SHEET_ID : 'a11447';
 const DOMAIN = 'https://open.feishu.cn';
 
 app.use(express.json({ limit: '50mb' }));
