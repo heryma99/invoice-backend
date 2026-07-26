@@ -124,7 +124,7 @@ function larkDownload(token, outRel){
 }
 
 /* ===================== 搜索缓存 ===================== */
-let rowCache=null;
+let rowCache=null, lastCacheErr=null;
 async function buildCache(){
   console.log('[cache] 预加载货件号索引...');
   try{
@@ -132,7 +132,8 @@ async function buildCache(){
     rowCache={};
     vals.forEach((v,i)=>{ const key=String(v).toUpperCase(); if(key) rowCache[key]=i+1; });
     console.log(`[cache] 索引就绪: ${Object.keys(rowCache).length} 个货件号`);
-  }catch(e){ console.log('[cache] 预加载失败:', e.message.substring(0,100)); rowCache={}; }
+    lastCacheErr=null;
+  }catch(e){ console.log('[cache] 预加载失败:', e.message.substring(0,100)); rowCache={}; lastCacheErr=e.message; }
 }
 async function findRow(fid){
   if(!rowCache) await buildCache();
@@ -306,9 +307,15 @@ app.get('/api/health', (req,res)=>res.json({ok:true, mode:CLOUD?'cloud':'local',
 app.get('/api/debug-cache', async (req,res)=>{
   const fid=req.query.fid;
   if(!rowCache) await buildCache();
-  if(!rowCache) return res.json({ok:false,msg:'cache not built',fid});
+  let probe={};
+  try{
+    const t=await cloudToken(); probe.tokenOk=true; probe.tokenHead=t.slice(0,10);
+    const j=await feishu('GET',`/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/values/${SHEET_ID}!B1:B3`);
+    probe.sample=(j.data&&j.data.valueRange&&j.data.valueRange.values)||[];
+  }catch(e){ probe.err=e.message; }
+  if(!rowCache) return res.json({ok:false,msg:'cache not built',fid, table:SPREADSHEET_TOKEN, sheet:SHEET_ID, lastCacheErr, probe});
   const key=String(fid).toUpperCase();
-  res.json({ok:true, mode:CLOUD?'cloud':'local', cacheSize:Object.keys(rowCache).length, hasKey:!!rowCache[key], row:rowCache[key], key, fid, sampleKeys:Object.keys(rowCache).slice(0,5)});
+  res.json({ok:true, mode:CLOUD?'cloud':'local', cacheSize:Object.keys(rowCache).length, hasKey:!!rowCache[key], row:rowCache[key], key, fid, sampleKeys:Object.keys(rowCache).slice(0,5), table:SPREADSHEET_TOKEN, sheet:SHEET_ID, probe});
 });
 app.post('/api/fetch-packing-list', async (req,res)=>{
   const {fid}=req.body||{}; if(!fid) return res.status(400).json({ok:false, error:'缺 fid'});
