@@ -58,13 +58,15 @@ async function cloudFindRow(fid){
   return null;
 }
 async function cloudGetAttachment(row, col){
-  const j = await feishu('GET', `/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/sheets/${SHEET_ID}/cells/${col}${row}`);
-  const cell = j.data && j.data.cells && j.data.cells[0];
-  if(!cell) return null;
-  if(cell.attachmentToken) return {token:cell.attachmentToken, name:cell.value||''};
-  if(cell.richText) for(const rt of cell.richText)
-    if(rt.attachment && rt.attachment.fileToken) return {token:rt.attachment.fileToken, name:rt.attachment.fileName||cell.value||''};
-  return null;
+  // 镜像表附件列存的是富文本字符串 "[{\"fileToken\":\"...\"}]"，从中解析 token
+  const range = `${SHEET_ID}!${col}${row}:${col}${parseInt(row)+1}`;
+  const j = await feishu('GET', `/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/values/${range}`);
+  const vals = j.data && j.data.valueRange && j.data.valueRange.values;
+  const raw = vals && vals[0] && vals[0][0];
+  if(!raw) return null;
+  const str = typeof raw==='string'?raw:JSON.stringify(raw);
+  const m = str.match(/fileToken["']?\s*[:"]\s*([A-Za-z0-9]+)/i);
+  return m?{token:m[1], name:''}:null;
 }
 async function cloudDownload(token, outPath){
   const t = await cloudToken();
