@@ -192,9 +192,9 @@ function isAmzWorkflow(rows){
 }
 function parseAmzWorkflow(rows){
   const items=[]; let mode=null, ci=null, boxCols=null;
-  const boxDims={}; // boxNo -> {weight,len,wid,hgt} (矩阵分区底部箱规)
+  const boxDims={}; // boxLabel -> {weight,len,wid,hgt} (矩阵分区底部箱规)
   const dimKey=s=> s.includes('重量')?'weight': s.includes('长度')?'len': s.includes('宽度')?'wid': s.includes('高度')?'hgt': null;
-  const mkItem=o=>({boxNo:'',sku:'',fnsku:'',nameCn:'',nameEn:'',qty:0,declare:'',cost:'',material:'',hs:'',brand:'',weight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',asin:'',...o});
+  const mkItem=o=>({boxNo:'',boxLabel:'',sku:'',fnsku:'',nameCn:'',nameEn:'',qty:0,declare:'',cost:'',material:'',hs:'',brand:'',weight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',asin:'',...o});
   for(const raw of rows){
     const vals=(raw||[]).map(v=>String(v==null?'':v).trim());
     const joined=vals.join(',');
@@ -202,7 +202,7 @@ function parseAmzWorkflow(rows){
     const dimCell=vals.findIndex(v=>v.startsWith('包装箱')&&dimKey(v));
     if(dimCell>=0 && boxCols){
       const k=dimKey(vals[dimCell]);
-      for(const bc of boxCols){ const v=vals[bc.idx]; if(v) (boxDims[bc.boxNo]=boxDims[bc.boxNo]||{})[k]=v; }
+      for(const bc of boxCols){ const v=vals[bc.idx]; if(v) (boxDims[bc.boxLabel]=boxDims[bc.boxLabel]||{})[k]=v; }
       continue;
     }
     /* 表头行 */
@@ -215,7 +215,10 @@ function parseAmzWorkflow(rows){
             qty:f(['每箱件数']), ctns:f(['箱子总数']), box:f(['箱号'])};
       } else { /* 矩阵分区(单件/混装): 箱号FBA...U000035做列头 */
         boxCols=[];
-        vals.forEach((h,i)=>{ const m=h.match(/U0*(\d+)$/); if(m) boxCols.push({idx:i, boxNo:'B'+parseInt(m[1])}); });
+        vals.forEach((h,i)=>{
+          const m=String(h).match(/U0*(\d+)$/);
+          if(m){ const n=parseInt(m[1]); boxCols.push({idx:i, boxNo:h, boxLabel:'B'+n}); }
+        });
         if(boxCols.length){ mode='matrix'; ci={sku:0, name:f(['商品名称']), asin:f(['ASIN']), fnsku:f(['FNSKU'])}; }
       }
       continue;
@@ -228,18 +231,20 @@ function parseAmzWorkflow(rows){
       let labels=String(vals[ci.box]||'').split(/[,，\s]+/).filter(Boolean);
       if(labels.length===0){ const n=parseInt(vals[ci.ctns])||1; for(let b=1;b<=n;b++) labels.push('B'+b); }
       for(const lb of labels){
-        const m=lb.match(/U0*(\d+)$/); const boxNo=m?('B'+parseInt(m[1])):lb;
-        items.push(mkItem({boxNo, sku, fnsku:vals[ci.fnsku]||'', nameEn, qty,
+        const m=lb.match(/U0*(\d+)$/);
+        const boxLabel = m ? ('B'+parseInt(m[1])) : lb;
+        const boxNo = m ? lb : '';
+        items.push(mkItem({boxNo, boxLabel, sku, fnsku:vals[ci.fnsku]||'', nameEn, qty,
           weight:vals[ci.weight]||'', len:vals[ci.len]||'', wid:vals[ci.wid]||'', hgt:vals[ci.hgt]||'', asin:vals[ci.asin]||''}));
       }
     } else { /* matrix: 每个箱列一个数量 */
       for(const bc of boxCols){
         const q=parseInt(vals[bc.idx])||0; if(!q) continue;
-        items.push(mkItem({boxNo:bc.boxNo, sku, fnsku:vals[ci.fnsku]||'', nameEn, qty:q, asin:vals[ci.asin]||''}));
+        items.push(mkItem({boxNo:bc.boxNo, boxLabel:bc.boxLabel, sku, fnsku:vals[ci.fnsku]||'', nameEn, qty:q, asin:vals[ci.asin]||''}));
       }
     }
   }
-  for(const it of items){ const d=boxDims[it.boxNo]; if(d){ it.weight=it.weight||d.weight||''; it.len=it.len||d.len||''; it.wid=it.wid||d.wid||''; it.hgt=it.hgt||d.hgt||''; } }
+  for(const it of items){ const d=boxDims[it.boxLabel]; if(d){ it.weight=it.weight||d.weight||''; it.len=it.len||d.len||''; it.wid=it.wid||d.wid||''; it.hgt=it.hgt||d.hgt||''; } }
   return items;
 }
 
@@ -283,7 +288,8 @@ async function parseXlsx(xlsxPath, fnskuPath){
     if(vals.every(v=>v===null||v===undefined||v==='')) continue;
     const get=idx=>idx>0&&vals[idx-1]!==null&&vals[idx-1]!==undefined?String(vals[idx-1]).trim():'';
     if(isAmazon){
-      const sku=get(col.sku), fnsku=get(col.fnsku), qtyPB=parseInt(get(col.qty))||0, ctns=parseInt(get(col.ctns))||1, bn=get(col.boxName), en=get(col.nameEn);
+      const sku=get(col.sku), fnsku=get(col.fnsku), qtyPB=parseInt(get(col.qty))||0, ctns=parseInt(get(col.ctns))||1, bn=get(col.boxName), fbaBoxStr=get(col.boxNo), en=get(col.nameEn);
+      // 箱子名称 -> 箱标 (B1/B2...)
       let labels=[];
       if(bn){ const last=bn.includes(' - ')?bn.split(' - ').pop():bn; const m=last.match(/^([A-Za-z]?)(\d+)\s*[～~\-]\s*([A-Za-z]?\d+)$/);
         if(m){ const prefix=m[1]||'B'; const start=parseInt(m[2]), end=parseInt(m[3].replace(/^[A-Za-z]/,'')); for(let b=start;b<=end;b++) labels.push(prefix+b); }
@@ -291,11 +297,25 @@ async function parseXlsx(xlsxPath, fnskuPath){
         else labels=bn.split(/[；;，,、\s]+/).filter(Boolean);
       }
       if(labels.length===0) for(let b=1;b<=ctns;b++) labels.push('B'+b);
-      for(const lb of labels){ const it={boxNo:lb,sku,fnsku,nameCn:get(col.nameCn),nameEn:en,qty:qtyPB,declare:get(col.declare),cost:get(col.cost),material:get(col.material),hs:get(col.hs),brand:get(col.brand),weight:get(col.weight),len:get(col.len),wid:get(col.wid),hgt:get(col.hgt),elec:(get(col.elec)||'').toUpperCase().startsWith('Y')?'Y':'N',magnet:(get(col.magnet)||'').toUpperCase().startsWith('Y')?'Y':'N',saleUrl:get(col.saleUrl)};
-        if(!it.nameEn){const k=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k]) it.nameEn=fnskuMap[k];} items.push(it); }
+      // 箱号 -> FBA 箱 ID (FBA19...U000001)
+      const parseFbaRange=str=>{
+        const s=String(str||'').replace(/[；;]$/,'').trim();
+        const m=s.match(/^(.+?)(\d+)～(\d+)$/);
+        if(m){ const prefix=m[1], start=parseInt(m[2]), end=parseInt(m[3]), pad=m[2].length; const arr=[]; for(let i=start;i<=end;i++) arr.push(prefix+String(i).padStart(pad,'0')); return arr; }
+        return s?[s]:[];
+      };
+      let fbaIds=parseFbaRange(fbaBoxStr);
+      if(fbaIds.length===0) for(let b=1;b<=ctns;b++) fbaIds.push('');
+      const count=Math.max(labels.length, fbaIds.length, ctns);
+      for(let k=0;k<count;k++){
+        const boxLabel=labels[k]||('B'+(k+1));
+        const boxNo=fbaIds[k]||'';
+        const it={boxNo, boxLabel, sku, fnsku, nameCn:get(col.nameCn), nameEn:en, qty:qtyPB, declare:get(col.declare), cost:get(col.cost), material:get(col.material), hs:get(col.hs), brand:get(col.brand), weight:get(col.weight), len:get(col.len), wid:get(col.wid), hgt:get(col.hgt), elec:(get(col.elec)||'').toUpperCase().startsWith('Y')?'Y':'N', magnet:(get(col.magnet)||'').toUpperCase().startsWith('Y')?'Y':'N', saleUrl:get(col.saleUrl)};
+        if(!it.nameEn){const k2=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k2]) it.nameEn=fnskuMap[k2];} items.push(it);
+      }
     } else {
       const sku=get(col.sku)||get(col.model);
-      const it={boxNo:get(col.boxNo),sku,fnsku:get(col.fnsku),nameCn:get(col.nameCn),nameEn:get(col.nameEn),qty:parseInt(get(col.qty))||1,declare:get(col.declare),cost:get(col.cost),material:get(col.material),hs:get(col.hs),brand:get(col.brand),weight:get(col.weight),len:get(col.len),wid:get(col.wid),hgt:get(col.hgt),elec:(get(col.elec)||'').toUpperCase().startsWith('Y')?'Y':'N',magnet:(get(col.magnet)||'').toUpperCase().startsWith('Y')?'Y':'N',saleUrl:get(col.saleUrl)};
+      const it={boxNo:get(col.boxNo),boxLabel:get(col.boxName),sku,fnsku:get(col.fnsku),nameCn:get(col.nameCn),nameEn:get(col.nameEn),qty:parseInt(get(col.qty))||1,declare:get(col.declare),cost:get(col.cost),material:get(col.material),hs:get(col.hs),brand:get(col.brand),weight:get(col.weight),len:get(col.len),wid:get(col.wid),hgt:get(col.hgt),elec:(get(col.elec)||'').toUpperCase().startsWith('Y')?'Y':'N',magnet:(get(col.magnet)||'').toUpperCase().startsWith('Y')?'Y':'N',saleUrl:get(col.saleUrl)};
       if(!it.nameEn){const k=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k]) it.nameEn=fnskuMap[k];} items.push(it);
     }
   }
