@@ -248,6 +248,79 @@ function parseAmzWorkflow(rows){
   return items;
 }
 
+/* --- 亚马逊/物流商「每箱多款SKU」矩阵 (列头: 第1箱/第2箱..., 底部行: 箱号/箱子名称/尺寸) --- */
+function isMskuPerBoxMatrix(rows){
+  return rows.some(r=>(r||[]).some(v=>/每箱多款/.test(String(v==null?'':v))))
+      || rows.some(r=>{
+          const joined=(r||[]).map(v=>String(v==null?'':v)).join(',');
+          return /第\s*\d+\s*箱/.test(joined) && (joined.includes('MSKU')||joined.includes('FNSKU'));
+        });
+}
+function parseMskuPerBoxMatrix(rows){
+  const items=[];
+  const mkItem=o=>({boxNo:'',boxLabel:'',sku:'',fnsku:'',nameCn:'',nameEn:'',qty:0,declare:'',cost:'',material:'',hs:'',brand:'JW PEI',weight:'',len:'',wid:'',hgt:'',elec:'N',magnet:'N',saleUrl:'',asin:'',...o});
+  // 1) find header row & box columns
+  let hi=-1, boxCols=[]; // {idx, boxIndex}
+  for(let i=0;i<rows.length;i++){
+    const found=[];
+    const r=rows[i]||[];
+    for(let j=0;j<r.length;j++){
+      const m=String(r[j]==null?'':r[j]).trim().match(/^第\s*(\d+)\s*箱$/);
+      if(m) found.push({idx:j, boxIndex:parseInt(m[1])});
+    }
+    if(found.length){ hi=i; boxCols=found; break; }
+  }
+  if(hi<0 || boxCols.length===0) return [];
+  // 2) scan bottom rows for box info
+  const boxInfo={}; // boxIndex -> {boxNo, boxLabel, weight, len, wid, hgt}
+  for(let i=hi+1;i<rows.length;i++){
+    const r=rows[i]||[];
+    if(!r.some(v=>v!==null&&v!==undefined&&String(v).trim()!=='')) continue;
+    const left=r.slice(0,5).map(v=>String(v==null?'':v).trim().toLowerCase()).join(' ');
+    const dimKey = left.includes('weight of box') ? 'weight'
+                 : left.includes('box length') ? 'len'
+                 : left.includes('box width') ? 'wid'
+                 : left.includes('box height') ? 'hgt' : null;
+    if(dimKey){
+      for(const bc of boxCols){ const v=r[bc.idx]; if(v!==null&&v!==undefined&&String(v).trim()!=='') (boxInfo[bc.boxIndex]=boxInfo[bc.boxIndex]||{})[dimKey]=String(v).trim(); }
+      continue;
+    }
+    if(left.includes('箱号') && !left.includes('箱子名称')){
+      for(const bc of boxCols){ const v=r[bc.idx]; if(v!==null&&v!==undefined) (boxInfo[bc.boxIndex]=boxInfo[bc.boxIndex]||{}).boxNo=String(v).trim(); }
+      continue;
+    }
+    if(left.includes('箱子名称')){
+      for(const bc of boxCols){ const v=r[bc.idx]; if(v!==null&&v!==undefined) (boxInfo[bc.boxIndex]=boxInfo[bc.boxIndex]||{}).boxLabel=String(v).trim(); }
+    }
+  }
+  // 3) find column indexes
+  const H=(rows[hi]||[]).map(v=>String(v==null?'':v).trim().toLowerCase());
+  const find=cands=>{for(let i=0;i<H.length;i++){for(const k of cands){if(H[i]===k||H[i].includes(k)) return i;}} return -1;};
+  const ci={sku:find(['msku','sku']), fnsku:find(['fnsku']), name:find(['品名','名称','商品名称'])};
+  // 4) parse SKU rows
+  for(let i=hi+1;i<rows.length;i++){
+    const r=rows[i]||[];
+    if(!r.some(v=>v!==null&&v!==undefined&&String(v).trim()!=='')) continue;
+    const seq=String(r[0]==null?'':r[0]).trim();
+    if(!/^\d+$/.test(seq)) continue;
+    const sku=ci.sku>=0?String(r[ci.sku]==null?'':r[ci.sku]).trim():'';
+    const fnsku=ci.fnsku>=0?String(r[ci.fnsku]==null?'':r[ci.fnsku]).trim():'';
+    if(!sku && !fnsku) continue;
+    const name=ci.name>=0?String(r[ci.name]==null?'':r[ci.name]).trim():'';
+    for(const bc of boxCols){
+      const v=r[bc.idx];
+      const q=(v===null||v===undefined||String(v).trim()==='')?0:parseInt(String(v).trim());
+      if(!q || isNaN(q)) continue;
+      const info=boxInfo[bc.boxIndex]||{};
+      const boxNo=info.boxNo || info.boxLabel || ('B'+bc.boxIndex);
+      const boxLabel=info.boxLabel || ('B'+bc.boxIndex);
+      items.push(mkItem({boxNo, boxLabel, sku, fnsku, nameEn:name, qty:q,
+        weight:info.weight||'', len:info.len||'', wid:info.wid||'', hgt:info.hgt||''}));
+    }
+  }
+  return items;
+}
+
 async function parseXlsx(xlsxPath, fnskuPath){
   const rows=await readRows(xlsxPath);
   if(!rows.length) return {items:[], error:'空表'};
@@ -264,6 +337,14 @@ async function parseXlsx(xlsxPath, fnskuPath){
     console.log(`[parse] 亚马逊箱内容清单CSV items=${items.length}`);
     const meta=parseHeaderMeta(rows);
     return {items, meta, error: items.length?null:'亚马逊CSV解析0行'};
+  }
+  /* 「每箱多款SKU」矩阵 (列头: 第1箱/第2箱..., 底部: 箱号/箱子名称/尺寸) */
+  if(isMskuPerBoxMatrix(rows)){
+    const items=parseMskuPerBoxMatrix(rows);
+    for(const it of items){ if(!it.nameEn){const k=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k]) it.nameEn=fnskuMap[k];} }
+    console.log(`[parse] 每箱多款SKU矩阵 items=${items.length}`);
+    const meta=parseHeaderMeta(rows);
+    return {items, meta, error: items.length?null:'每箱多款SKU矩阵解析0行'};
   }
   /* 通用表格 (xlsx或普通CSV) */
   const getCell=(r,c)=>{ const v=(rows[r-1]||[])[c-1]; return v===null||v===undefined?'':v; };
