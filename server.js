@@ -416,6 +416,29 @@ app.post('/api/fetch-packing-list', async (req,res)=>{
   }catch(e){ console.error('[err]',e.message); res.status(500).json({ok:false, error:e.message, code:e.code}); }
 });
 
+/* ===================== 全量货件列表（生成预装脚本用） ===================== */
+app.get('/api/list-handovers', async (req,res)=>{
+  try{
+    let rows;
+    if(CLOUD){
+      const j = await feishu('GET', `/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/values/${SHEET_ID}!A1:X960`);
+      rows = (j.data && j.data.valueRange && j.data.valueRange.values) || [];
+    } else {
+      const r = larkRaw(`lark-cli sheets +csv-get --url "https://plbrands.feishu.cn/sheets/${SPREADSHEET_TOKEN}" --sheet-id ${SHEET_ID} --range A1:X960`);
+      rows = (r.data&&r.data.annotated_csv||'').split('\n').map(l=>{const m=l.match(/\[row=(\d+)\]\s*(.+)/); return m?m[2].replace(/^"|"$/g,'').split(','):[];});
+    }
+    const results=[];
+    for(let i=1;i<rows.length;i++){
+      const vals=rows[i]||[];
+      if(!vals.length || !String(vals[1]||'').trim()) continue; // 跳过 B 列(货件号)空行
+      const g=idx=>(vals[idx]!==undefined&&vals[idx]!==null)?String(vals[idx]).trim():'';
+      const pl=g(15), fk=g(16);
+      results.push({row:i+1, internal_no:g(0), fba_shipment:g(1), created:g(2), country:g(3), air_sea:g(4), qty:g(5), boxes:g(6), carrier:g(10), pickup_addr:g(11), fba_label:g(14), packing_list:pl, fnsku_file:fk, invoice_drop:g(23), hasPacking:!!pl.trim(), hasFnsku:!!fk.trim()});
+    }
+    res.json({ok:true, count:results.length, results, mode:CLOUD?'cloud':'local', table:SPREADSHEET_TOKEN, sheet:SHEET_ID});
+  }catch(e){ console.error('[list-handovers]',e.message); res.status(500).json({ok:false, error:e.message}); }
+});
+
 if(require.main===module){
   app.listen(PORT, ()=>{
     console.log(`\n  🚀 发票后端启动 mode=${CLOUD?'cloud(HTTP直连)':'local(lark-cli)'} port=${PORT}`);
