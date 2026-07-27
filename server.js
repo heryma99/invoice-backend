@@ -262,7 +262,8 @@ async function parseXlsx(xlsxPath, fnskuPath){
     const items=parseAmzWorkflow(rows);
     for(const it of items){ if(!it.nameEn){const k=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k]) it.nameEn=fnskuMap[k];} }
     console.log(`[parse] 亚马逊箱内容清单CSV items=${items.length}`);
-    return {items, error: items.length?null:'亚马逊CSV解析0行'};
+    const meta=parseHeaderMeta(rows);
+    return {items, meta, error: items.length?null:'亚马逊CSV解析0行'};
   }
   /* 通用表格 (xlsx或普通CSV) */
   const getCell=(r,c)=>{ const v=(rows[r-1]||[])[c-1]; return v===null||v===undefined?'':v; };
@@ -319,9 +320,25 @@ async function parseXlsx(xlsxPath, fnskuPath){
       if(!it.nameEn){const k=(it.fnsku||it.sku||'').toUpperCase(); if(fnskuMap[k]) it.nameEn=fnskuMap[k];} items.push(it);
     }
   }
-  return {items, error:null};
+  const meta=parseHeaderMeta(rows);
+  return {items, meta, error:null};
 }
 
+/* --- 解析装箱清单表头元数据: 货件名称(含FC代码)/配送地址/箱数等 --- */
+function parseHeaderMeta(rows){
+  const meta={};
+  const KEYMAP={'工作流程名称':'workflowName','货件编号':'shipmentNo','货件名称':'shipmentName','配送地址':'destAddress','箱子数量':'boxes','SKU 数量':'skuCount','商品数量':'qty'};
+  for(let i=0;i<Math.min(rows.length,14);i++){
+    const r=(rows[i]||[]).map(v=>String(v==null?'':v).trim());
+    if(r.length>=2 && KEYMAP[r[0]]) meta[KEYMAP[r[0]]]=r[1];
+  }
+  // FC 代码: 货件名称形如 "FBA STA (...) - RUH8" 或 "FBA15...-RUH8"
+  if(meta.shipmentName){
+    const m=meta.shipmentName.match(/([A-Z]{3,4}\d{1,3})\s*$/);
+    if(m) meta.fcCode=m[1];
+  }
+  return meta;
+}
 /* ===================== 路由 ===================== */
 app.get('/api/health', (req,res)=>res.json({ok:true, mode:CLOUD?'cloud':'local', time:new Date().toISOString(), pid:process.pid}));
 app.get('/api/debug-cache', async (req,res)=>{
@@ -410,9 +427,9 @@ app.post('/api/fetch-packing-list', async (req,res)=>{
     let fRel=null;
     if(fnsku){ try{ fRel=`${fid}_f.xlsx`; const fn=await download(fnsku.token, fRel); if(!fn){ fRel=null; console.log('[fnsku] 下载失败, 跳过(仅影响品名映射)'); } }catch(e){ fRel=null; console.log('[fnsku] 下载异常, 跳过:', e.message.slice(0,60)); } }
     const xp=path.join(TMP_DIR,pRel); const fp=fRel?path.join(TMP_DIR,fRel):null;
-    const {items,error:pe}=await parseXlsx(xp,fp);
+    const {items,meta,error:pe}=await parseXlsx(xp,fp);
     try{fs.unlinkSync(xp)}catch(_){} if(fp) try{fs.unlinkSync(fp)}catch(_){}
-    res.json({ok:true, fid, row, mode:CLOUD?'cloud':'local', packingName:pack.name, items, itemCount:items.length, parseError:pe});
+    res.json({ok:true, fid, row, mode:CLOUD?'cloud':'local', packingName:pack.name, items, itemCount:items.length, meta:meta||{}, parseError:pe});
   }catch(e){ console.error('[err]',e.message); res.status(500).json({ok:false, error:e.message, code:e.code}); }
 });
 
