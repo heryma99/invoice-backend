@@ -337,6 +337,63 @@ app.get('/api/debug-cache', async (req,res)=>{
   const key=String(fid).toUpperCase();
   res.json({ok:true, mode:CLOUD?'cloud':'local', cacheSize:Object.keys(rowCache).length, hasKey:!!rowCache[key], row:rowCache[key], key, fid, sampleKeys:Object.keys(rowCache).slice(0,5), table:SPREADSHEET_TOKEN, sheet:SHEET_ID, probe});
 });
+/* ===================== 实时搜索交接清单（倒着填用） ===================== */
+// 本机：读某列（annotated_csv 解析）
+function localColumn(col, maxRow){
+  const r = larkRaw(`lark-cli sheets +csv-get --url "https://plbrands.feishu.cn/sheets/${SPREADSHEET_TOKEN}" --sheet-id ${SHEET_ID} --range ${col}1:${col}${maxRow}`);
+  return (r.data&&r.data.annotated_csv||'').split('\n').map(l=>{const m=l.match(/\[row=(\d+)\]\s*(.+)/); return m?m[2].replace(/^"|"$/g,'').trim():'';});
+}
+// 读一整行 A-X，返回值的数组（云端/本机自适应）
+async function readRowValues(row){
+  if(CLOUD){
+    const j = await feishu('GET', `/open-apis/sheets/v2/spreadsheets/${SPREADSHEET_TOKEN}/values/${SHEET_ID}!A${row}:X${row}`);
+    const vals = j.data && j.data.valueRange && j.data.valueRange.values && j.data.valueRange.values[0];
+    return vals || [];
+  }
+  const r = larkRaw(`lark-cli sheets +cells-get --url "https://plbrands.feishu.cn/sheets/${SPREADSHEET_TOKEN}" --sheet-id ${SHEET_ID} --range A${row}:X${row}`);
+  const cells = r.data && r.data.ranges && r.data.ranges[0] && r.data.ranges[0].cells;
+  if(!cells || !cells[0]) return [];
+  return cells[0].map(c=>{
+    if(c==null) return '';
+    if(c.value!==undefined && c.value!==null) return c.value;
+    if(c.attachmentToken) return JSON.stringify([{fileToken:c.attachmentToken}]);
+    if(c.rich_text) for(const rt of c.rich_text){ if(rt.attachment_token) return JSON.stringify([{fileToken:rt.attachment_token}]); }
+    return '';
+  });
+}
+// 把一整行映射成与前端 HANDOVER_INDEX 一致的字段结构
+async function readRowFull(row){
+  const vals = await readRowValues(row);
+  if(!vals.length) return null;
+  const g = i => (vals[i]!==undefined && vals[i]!==null) ? String(vals[i]) : '';
+  const pl = g(15), fk = g(16);
+  return {
+    row,
+    internal_no: g(0), fba_shipment: g(1), created: g(2), country: g(3), air_sea: g(4),
+    qty: g(5), boxes: g(6), carrier: g(10), pickup_addr: g(11), fba_label: g(14),
+    packing_list: pl, fnsku_file: fk, invoice_drop: g(23),
+    hasPacking: !!pl.trim(), hasFnsku: !!fk.trim()
+  };
+}
+app.get('/api/search-handover', async (req,res)=>{
+  const q=(req.query.q||'').trim().toUpperCase();
+  if(q.length<2) return res.json({ok:true, results:[], mode:CLOUD?'cloud':'local'});
+  try{
+    const bCol = CLOUD ? await cloudCsvColumn('B',1200) : localColumn('B',1200);
+    const rows=[];
+    bCol.forEach((v,i)=>{ if(String(v).toUpperCase().includes(q)) rows.push(i+1); });
+    const aCol = CLOUD ? await cloudCsvColumn('A',1200) : localColumn('A',1200);
+    aCol.forEach((v,i)=>{ if(String(v).toUpperCase().includes(q) && !rows.includes(i+1)) rows.push(i+1); });
+    rows.sort((a,b)=>a-b);
+    const results=[];
+    for(const row of rows.slice(0,25)){
+      const r = await readRowFull(row);
+      if(r) results.push(r);
+    }
+    res.json({ok:true, results, mode:CLOUD?'cloud':'local', table:SPREADSHEET_TOKEN, sheet:SHEET_ID, source: CLOUD?'镜像表(实时)':'源表(实时)'});
+  }catch(e){ console.error('[search-handover]',e.message); res.status(500).json({ok:false, error:e.message, code:e.code}); }
+});
+
 app.post('/api/fetch-packing-list', async (req,res)=>{
   const {fid}=req.body||{}; if(!fid) return res.status(400).json({ok:false, error:'缺 fid'});
   console.log(`\n========== ${fid} ==========`);
